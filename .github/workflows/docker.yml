@@ -161,8 +161,20 @@ jobs:
       - name: Get short SHA
         id: get_short_sha
         run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      # Test the image this run pushed: ghcr.io/<owner>/<repo>, lowercased as
+      # docker/metadata-action does, so forks do not pull wandb's registry.
+      - name: Get image name
+        id: get_image
+        run: echo "image=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+      - name: Log in to the Container registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Run Playwright tests
         env:
+          DOCKER_IMAGE: ${{ steps.get_image.outputs.image }}
           DOCKER_TAG: sha-${{ steps.get_short_sha.outputs.short_sha }}
         working-directory: ./frontend
         run: pnpm exec playwright test
