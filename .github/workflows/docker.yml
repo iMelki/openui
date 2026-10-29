@@ -54,6 +54,7 @@ jobs:
         with:
           name: frontend-${{ github.sha }}
           path: ./frontend/dist
+          retention-days: 7
       - name: Checking in frontend assets
         if: github.ref == 'refs/heads/main'
         run: |
@@ -173,7 +174,7 @@ jobs:
           path: |
             ./frontend/playwright-report/
             ./frontend/screenshots/
-          retention-days: 30
+          retention-days: 3
 
   release:
     needs: test
