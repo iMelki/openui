@@ -54,6 +54,7 @@ jobs:
         with:
           name: frontend-${{ github.sha }}
           path: ./frontend/dist
+          retention-days: 7
       - name: Checking in frontend assets
         if: github.ref == 'refs/heads/main'
         run: |
@@ -70,9 +71,17 @@ jobs:
       packages: write
       attestations: write
       id-token: write
+    outputs:
+      docker_tag: ${{ steps.sha_tag.outputs.docker_tag }}
     steps:
+      # Same format as metadata-action type=sha (sha- plus 7 char short sha), passed to the test job.
+      - name: Compute pushed sha tag
+        id: sha_tag
+        run: echo "docker_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -129,6 +138,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         name: Install pnpm
         with:
@@ -158,12 +169,10 @@ jobs:
       - name: Install Playwright Browsers
         working-directory: ./frontend
         run: pnpm exec playwright install --with-deps chromium webkit
-      - name: Get short SHA
-        id: get_short_sha
-        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
       - name: Run Playwright tests
         env:
-          DOCKER_TAG: sha-${{ steps.get_short_sha.outputs.short_sha }}
+          # Exact sha-<short> tag that build-and-push-image pushed.
+          DOCKER_TAG: ${{ needs.build-and-push-image.outputs.docker_tag }}
         working-directory: ./frontend
         run: pnpm exec playwright test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -173,10 +182,10 @@ jobs:
           path: |
             ./frontend/playwright-report/
             ./frontend/screenshots/
-          retention-days: 30
+          retention-days: 3
 
   release:
-    needs: test
+    needs: [build-and-push-image, test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -190,13 +199,13 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Convert full SHA to short SHA
-        id: get_short_sha
-        run: echo "short_sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
       - name: Tag latest image
         if: github.ref == 'refs/heads/main'
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Exact sha-<short> tag that build-and-push-image pushed.
+          DOCKER_TAG: ${{ needs.build-and-push-image.outputs.docker_tag }}
         run: |
-          docker manifest inspect ${{ env.IMAGE }}:sha-${{ steps.get_short_sha.outputs.short_sha }}
-          docker buildx imagetools create --tag ${{ env.IMAGE }}:latest ${{ env.IMAGE }}:sha-${{ steps.get_short_sha.outputs.short_sha }}
+          # Registry paths must be lowercase (same as the test job's image ref).
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          docker manifest inspect "${IMAGE}:${DOCKER_TAG}"
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}:${DOCKER_TAG}"
