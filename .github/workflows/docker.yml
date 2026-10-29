@@ -71,7 +71,13 @@ jobs:
       packages: write
       attestations: write
       id-token: write
+    outputs:
+      docker_tag: ${{ steps.sha_tag.outputs.docker_tag }}
     steps:
+      # Same format as metadata-action type=sha (sha- plus 7 char short sha), passed to the test job.
+      - name: Compute pushed sha tag
+        id: sha_tag
+        run: echo "docker_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Download build artifacts
@@ -159,12 +165,10 @@ jobs:
       - name: Install Playwright Browsers
         working-directory: ./frontend
         run: pnpm exec playwright install --with-deps chromium webkit
-      - name: Get short SHA
-        id: get_short_sha
-        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
       - name: Run Playwright tests
         env:
-          DOCKER_TAG: sha-${{ steps.get_short_sha.outputs.short_sha }}
+          # Exact sha-<short> tag that build-and-push-image pushed.
+          DOCKER_TAG: ${{ needs.build-and-push-image.outputs.docker_tag }}
         working-directory: ./frontend
         run: pnpm exec playwright test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
