@@ -60,6 +60,7 @@ jobs:
           git config user.name github-actions
           git config user.email github-actions@github.com
           git add backend/openui/dist
+          if git diff --cached --quiet; then echo "no frontend asset changes"; exit 0; fi
           git commit -m "Updated frontend assets"
           git push
   build-and-push-image:
