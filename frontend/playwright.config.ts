@@ -77,9 +77,7 @@ export default defineConfig({
 
 	/* Run your local dev server before starting the tests */
 	webServer: {
-		// CI sets IMAGE_NAME to this repo (github.repository) so the test runs the image this PR built.
-		// The wandb/openui fallback is only for local runs where IMAGE_NAME is not set.
-		command: `docker run --rm --name openui -p 7979:7878 ghcr.io/${(process.env.IMAGE_NAME ?? 'wandb/openui').toLowerCase()}:${process.env.DOCKER_TAG ?? 'latest'}`,
+		command: `docker run --rm --name openui -p 7979:7878 ${process.env.DOCKER_IMAGE ?? 'ghcr.io/wandb/openui'}:${process.env.DOCKER_TAG ?? 'latest'}`,
 		url: 'http://127.0.0.1:7979',
 		reuseExistingServer: !process.env.CI,
 		timeout: 90_000
