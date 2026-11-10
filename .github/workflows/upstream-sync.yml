@@ -1,0 +1,213 @@
+# Weekly upstream sync for this fork.
+#
+# What it does, without rewriting any published history:
+#   1. Picks the integration branch: `dev` if it exists, otherwise the default branch.
+#   2. Builds the `sync/upstream` branch: the open sync branch if one exists,
+#      otherwise a fresh branch from the integration branch.
+#   3. Merges the upstream default branch into it with a merge commit.
+#   4. Pushes it (fast-forward only, never a force push) and opens or updates
+#      one draft PR, "chore(sync): merge upstream <date>", into the integration branch.
+#
+# On conflicts it still opens the PR: the merge is committed with conflict markers,
+# the title is suffixed "[conflicts]", and the body lists the conflicted files.
+# Later runs leave that branch alone until someone resolves it, so nothing compounds.
+#
+# Merge the PR with a merge commit (not squash or rebase); otherwise the next run
+# has to re-merge the same upstream history.
+#
+# Token: GITHUB_TOKEN is enough unless the upstream range changes files under
+# .github/workflows/ (GitHub refuses that push without the `workflows` permission,
+# which GITHUB_TOKEN cannot hold). For that case add a repository secret
+# UPSTREAM_SYNC_TOKEN (fine-grained PAT on this repo: contents, pull requests and
+# workflows read/write). The run fails with an explicit message if it is needed.
+# GITHUB_TOKEN also needs "Allow GitHub Actions to create and approve pull requests"
+# (Settings > Actions > General) to open the PR. PRs opened with GITHUB_TOKEN do not
+# trigger pull_request workflows; close and reopen the PR to run CI on it.
+
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge wandb/openui into sync/upstream
+    if: github.repository_owner == 'iMelki'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UPSTREAM_REPO: wandb/openui
+      # Empty means the upstream repository's default branch.
+      UPSTREAM_BRANCH: ""
+      SYNC_BRANCH: sync/upstream
+      HAS_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream and open or update the PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          note() { echo "$*"; echo "$*" >> "$summary"; }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          default_branch=$(git ls-remote --symref origin HEAD | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
+          if git ls-remote --exit-code --heads origin dev >/dev/null; then integ=dev; else integ="$default_branch"; fi
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          up_branch="${UPSTREAM_BRANCH}"
+          if [ -z "$up_branch" ]; then
+            up_branch=$(git ls-remote --symref upstream HEAD | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
+          fi
+          git fetch --no-tags upstream "+refs/heads/${up_branch}:refs/remotes/upstream/${up_branch}"
+          git fetch --no-tags origin "+refs/heads/${integ}:refs/remotes/origin/${integ}"
+          up_sha=$(git rev-parse "refs/remotes/upstream/${up_branch}")
+          up_short=$(git rev-parse --short "$up_sha")
+          today=$(date -u +%F)
+
+          note "### Upstream sync: ${UPSTREAM_REPO}@${up_branch} (${up_short}) into ${integ}"
+
+          if git merge-base --is-ancestor "$up_sha" "origin/${integ}"; then
+            note "Up to date: ${integ} already contains upstream ${up_short}. Nothing to do."
+            exit 0
+          fi
+
+          # Start from the open sync branch, unless it is absent or already merged.
+          existing=false
+          if git ls-remote --exit-code --heads origin "$SYNC_BRANCH" >/dev/null; then
+            git fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            if git merge-base --is-ancestor "origin/${SYNC_BRANCH}" "origin/${integ}"; then
+              start="origin/${integ}"
+            else
+              start="origin/${SYNC_BRANCH}"
+              existing=true
+            fi
+          else
+            start="origin/${integ}"
+          fi
+          git checkout -q -B "$SYNC_BRANCH" "$start"
+
+          pr_number=$(gh pr list --head "$SYNC_BRANCH" --base "$integ" --state open --json number --jq '.[0].number // empty' || true)
+
+          # An earlier run committed conflicts that nobody has resolved yet: leave it.
+          head_msg=$(git log -1 --format=%B HEAD)
+          if [ "$existing" = true ] && grep -q '^Upstream-Sync-Conflicts: unresolved' <<<"$head_msg"; then
+            behind=$(git rev-list --count "HEAD..${up_sha}")
+            note "::warning::${SYNC_BRANCH} still has unresolved conflicts from an earlier run (PR #${pr_number:-none}). Upstream has ${behind} newer commit(s). Resolve on ${SYNC_BRANCH} and push; the next run continues from there."
+            exit 0
+          fi
+
+          # Keep the sync branch current with the integration branch.
+          if ! git merge-base --is-ancestor "origin/${integ}" HEAD; then
+            if ! git merge --no-edit -m "chore(sync): merge ${integ} into ${SYNC_BRANCH}" "origin/${integ}"; then
+              git merge --abort
+              note "::error::Merging ${integ} into the existing ${SYNC_BRANCH} conflicts. Resolve it by hand on ${SYNC_BRANCH}, or delete ${SYNC_BRANCH} and close PR #${pr_number:-none} so the next run starts fresh."
+              exit 1
+            fi
+          fi
+
+          status=clean
+          conflicts=""
+          if git merge-base --is-ancestor "$up_sha" HEAD; then
+            status=already-merged
+          elif git merge --no-ff --no-edit -m "chore(sync): merge upstream ${UPSTREAM_REPO}@${up_short} (${today})" "$up_sha"; then
+            status=clean
+          else
+            status=conflict
+            conflicts=$(git diff --name-only --diff-filter=U)
+            git add -A
+            git commit -q --no-edit \
+              -m "chore(sync): merge upstream ${UPSTREAM_REPO}@${up_short} (${today}) [conflicts]" \
+              -m "Committed with conflict markers so the PR can show them. Resolve on ${SYNC_BRANCH} before merging." \
+              -m "Upstream-Sync-Conflicts: unresolved"
+          fi
+
+          # GITHUB_TOKEN cannot push commits that add or change workflow files.
+          workflow_changes=$(git log --format= --name-only HEAD --not --remotes=origin -- .github/workflows | sort -u | sed '/^$/d')
+          if [ -n "$workflow_changes" ] && [ "$HAS_SYNC_TOKEN" != "true" ]; then
+            note "::error::The upstream range changes workflow files, and GITHUB_TOKEN may not push those. Add the repository secret UPSTREAM_SYNC_TOKEN (fine-grained PAT on this repo: contents, pull requests and workflows read/write) and re-run. Files:"
+            echo "$workflow_changes" | sed 's/^/- /' | tee -a "$summary"
+            exit 1
+          fi
+
+          if [ "$existing" = true ] && [ "$(git rev-parse HEAD)" = "$(git rev-parse "$start")" ]; then
+            if [ -n "$pr_number" ]; then
+              note "No new upstream commits since the last run; PR #${pr_number} is unchanged."
+              exit 0
+            fi
+          else
+            git push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          fi
+
+          upstream_new=$(git rev-list --count "origin/${integ}..${up_sha}")
+          fork_only=$(git rev-list --count --no-merges "${up_sha}..origin/${integ}")
+          security=$(git log --no-merges --format='- %h %s' "origin/${integ}..${up_sha}" \
+            | grep -iE '\bsecurity\b|\bcve-[0-9]|vulnerab|ghsa-|\bssrf\b|\bxss\b|\brce\b|path traversal' | head -25 || true)
+
+          title="chore(sync): merge upstream ${today}"
+          [ "$status" = conflict ] && title="${title} [conflicts]"
+
+          {
+            echo "Automated upstream sync from \`${UPSTREAM_REPO}\` branch \`${up_branch}\` at \`${up_sha}\` into \`${integ}\`."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Upstream commits not yet in \`${integ}\` | ${upstream_new} |"
+            echo "| Fork-only commits on \`${integ}\` (non-merge) | ${fork_only} |"
+            echo "| Merge result | ${status} |"
+            echo
+            if [ "$status" = conflict ]; then
+              echo "## Conflicts"
+              echo
+              echo "The merge commit on \`${SYNC_BRANCH}\` contains conflict markers in these files. Resolve them on \`${SYNC_BRANCH}\`, push, then mark this PR ready. Weekly runs skip this branch until a commit lands on top of the conflicted merge."
+              echo
+              echo "$conflicts" | sed 's/^/- `/; s/$/`/'
+              echo
+            fi
+            if [ -n "$security" ]; then
+              echo "## Upstream commits with security-related titles"
+              echo
+              echo "$security"
+              echo
+            fi
+            echo "## Before merging"
+            echo
+            echo "- Run the repo's own checks on this branch. PRs opened by GITHUB_TOKEN do not trigger CI; close and reopen the PR to run it."
+            echo "- Keep intentional fork changes when resolving conflicts; otherwise prefer upstream."
+            echo "- Merge with a merge commit (not squash or rebase) so the next sync only brings new upstream commits."
+            echo
+            echo "Opened by \`.github/workflows/upstream-sync.yml\` (run ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-})."
+          } > "${RUNNER_TEMP:-/tmp}/sync-pr-body.md"
+
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --title "$title" --body-file "${RUNNER_TEMP:-/tmp}/sync-pr-body.md"
+            note "Updated PR #${pr_number} (${status})."
+          else
+            if ! gh pr create --draft --base "$integ" --head "$SYNC_BRANCH" --title "$title" --body-file "${RUNNER_TEMP:-/tmp}/sync-pr-body.md"; then
+              note "::error::Could not open the PR. With GITHUB_TOKEN, enable Settings > Actions > General > 'Allow GitHub Actions to create and approve pull requests', or add the UPSTREAM_SYNC_TOKEN secret. Branch ${SYNC_BRANCH} was pushed."
+              exit 1
+            fi
+            note "Opened a draft PR (${status})."
+          fi
+
+          if [ "$status" = conflict ]; then
+            note "::warning::Upstream merge has conflicts in: $(echo "$conflicts" | tr '\n' ' ')"
+          fi
